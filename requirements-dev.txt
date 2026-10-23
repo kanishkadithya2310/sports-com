@@ -1,0 +1,2 @@
+# Only needed on your own computer for the optional PostgreSQL integration test (not for Streamlit Cloud)
+psycopg2-binary==2.9.10
