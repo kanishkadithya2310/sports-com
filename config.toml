@@ -1,9 +1,0 @@
-[theme]
-base = "dark"
-primaryColor = "#22D3EE"
-backgroundColor = "#050816"
-secondaryBackgroundColor = "#0B1230"
-textColor = "#EAF0FF"
-
-[server]
-enableXsrfProtection = true
