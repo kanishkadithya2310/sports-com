@@ -32,6 +32,8 @@ import html
 import io
 import json
 import logging
+from functools import lru_cache
+from pathlib import Path
 import random
 import re
 import secrets
@@ -107,6 +109,105 @@ def secret(name: str) -> str:
         return str(st.secrets.get(name, "") or "").strip().strip("\"'").strip()
     except Exception:
         return ""
+
+
+# --------------------------------------------------------------------------- events and images
+EVENT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,23}$")
+DEFAULT_EVENTS = {"main": "Cricket", "football": "Football"}      # id -> label. "main" is the original auction (cricket).
+ACTIVE_CFG = "_config"                                              # database row that remembers which event is active
+_CFG_LOCK = threading.Lock()
+_CFG: dict = {"backend": None, "made": False}
+_ACTIVE: dict = {"t": 0.0, "v": EVENT_ID}
+
+
+def event_labels() -> dict:
+    """Events the admin can switch between. Default: Cricket (id main) and Football.
+    Override with a secret, e.g.  EVENTS = "main:Cricket,football:Football,basketball:Basketball"."""
+    out = {}
+    for part in secret("EVENTS").split(","):
+        k, _, v = part.partition(":")
+        k = k.strip().lower()
+        if EVENT_RE.match(k) and k != ACTIVE_CFG:
+            out[k] = v.strip() or k.title()
+    return out or dict(DEFAULT_EVENTS)
+
+
+def config_backend():
+    with _CFG_LOCK:
+        if not _CFG["made"]:
+            _CFG["backend"], _ = make_backend(ACTIVE_CFG)
+            _CFG["made"] = True
+        return _CFG["backend"]
+
+
+def active_event() -> str:
+    """The event every screen (projector, managers, organiser) is currently showing. Read through a 2-second cache."""
+    now = time.time()
+    with _CFG_LOCK:
+        if now - _ACTIVE["t"] < 2.0:
+            return _ACTIVE["v"]
+    val, be = None, config_backend()
+    if be is not None:
+        try:
+            state, _ = be.get_state()
+            if state is None:
+                be.init_state({**new_state(), "active": EVENT_ID})
+                state, _ = be.get_state()
+            val = (state or {}).get("active")
+        except BackendError:
+            val = None                                   # database blip: keep showing the last known event
+    with _CFG_LOCK:
+        if val in event_labels():
+            _ACTIVE["v"] = val
+        _ACTIVE["t"] = now
+        return _ACTIVE["v"]
+
+
+def current_event() -> str:
+    return active_event()
+
+
+def switch_event(target: str, current_backend) -> tuple[bool, str]:
+    """Organiser action: make `target` the active event for everyone. Refused while a player is on the block."""
+    labels = event_labels()
+    if target not in labels:
+        return False, "Unknown event."
+    be = config_backend()
+    if be is None:
+        return False, "Event switching is unavailable (database not configured)."
+    try:
+        if current_backend is not None:
+            state, _ = current_backend.get_state()
+            if state and state.get("current"):
+                return False, "A player is on the block. Finish the current lot before switching events."
+        for _ in range(3):
+            cfg, rev = be.get_state()
+            if cfg is None:
+                be.init_state({**new_state(), "active": EVENT_ID})
+                cfg, rev = be.get_state()
+            out = be.commit(rev, {**cfg, "active": target}, uuid.uuid4().hex, "admin", f"active event -> {target}")
+            if out.get("status") == "committed":
+                with _CFG_LOCK:
+                    _ACTIVE.update(t=time.time(), v=target)
+                return True, f"Now running the {labels[target]} auction. Projector and manager screens follow."
+        return False, "Could not switch right now. Please try again."
+    except BackendError as exc:
+        return False, f"Database unavailable ({exc}). Nothing was changed."
+
+
+def slug(x) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", str(x).lower()).strip("-")[:60]
+
+
+@lru_cache(maxsize=4096)
+def static_img(kind: str, name: str) -> str:
+    """URL of static/<kind>/<slug(name)>.png|jpg|jpeg|webp if that file exists, else ''. kind '' = static/ itself."""
+    sl = slug(name)
+    if sl:
+        for ext in IMG_EXTS:
+            if ((STATIC_DIR / kind) if kind else STATIC_DIR).joinpath(sl + ext).is_file():
+                return f"/app/static/{kind + '/' if kind else ''}{sl}{ext}"
+    return ""
 
 
 def clean_text(x, maxlen: int) -> str:
@@ -1066,7 +1167,7 @@ class Store:
         self._checked = time.time()
 
 
-def make_backend():
+def make_backend(event: str = EVENT_ID):
     url, key = secret("SUPABASE_URL").rstrip("/"), secret("SUPABASE_KEY")
     if url.endswith("/rest/v1"):
         url = url[: -len("/rest/v1")]
@@ -1074,12 +1175,14 @@ def make_backend():
         return MemoryBackend(), ""
     if not (url.startswith("https://") and key):
         return None, "SUPABASE_URL / SUPABASE_KEY are set but look wrong. The auction is disabled until they are fixed."
-    return SupabaseBackend(url, key), ""
+    return SupabaseBackend(url, key, event), ""
 
 
 @st.cache_resource
-def get_store() -> Store:
-    backend, err = make_backend()
+def get_store(event: str = EVENT_ID) -> Store:
+    if not event:
+        return Store(None, "This event link is not recognised. Check the web address (the ?event= part).")
+    backend, err = make_backend(event)
     return Store(backend, err)
 
 
@@ -1090,6 +1193,9 @@ def manager_session(sn: Snap):
     if not sess:
         return None
     m = sn.view["managers"].get(sess["id"]) if sn.view else None
+    if sess.get("event") != current_event():           # the organiser switched events: sign in again
+        st.session_state.pop("au_mgr", None)
+        return None
     if time.time() > sess["exp"]:
         st.session_state.pop("au_mgr", None)
         return None
@@ -1247,6 +1353,22 @@ CSS = """<style>
 .au-teamstat-row{display:flex;justify-content:space-between;gap:4px;background:#343434;border-radius:3px;padding:5px 6px;margin:3px 0;font-size:.63rem}
 @media(max-width:1050px){.au-teamstats{grid-template-columns:1fr}.au-pname{font-size:1.7rem}}
 @media(max-width:760px){.au-dashboard-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.au-grid{grid-template-columns:1fr 1fr}.au-teamstats{grid-template-columns:repeat(2,minmax(0,1fr))}}
+/* ISC logo, photos, neon leader */
+.au-brandrow{display:flex;align-items:center;gap:14px}
+.au-logo{height:56px;width:56px;object-fit:contain;background:#fff;border-radius:10px;padding:3px;flex:none}
+.au-herorow{display:flex;gap:18px;align-items:center}
+.au-photo{width:clamp(84px,9vw,150px);height:clamp(84px,9vw,150px);border-radius:14px;object-fit:cover;border:2px solid #3b3b3b;background:#333;flex:none;display:block}
+.au-timg{max-height:100%;max-width:100%;object-fit:contain;padding:3px}
+.au-manager{position:relative;transition:box-shadow .25s,opacity .25s,transform .25s}
+.au-manager-lead{border-color:#22f0ff;transform:scale(1.03);z-index:1;background:#10282e;
+ box-shadow:0 0 6px #22f0ff,0 0 20px rgba(34,240,255,.75),0 0 44px rgba(139,92,246,.6),inset 0 0 16px rgba(34,240,255,.25);animation:neonpulse 1.3s ease-in-out infinite alternate}
+.au-manager-lead .au-manager-team{color:#7ff6ff;text-shadow:0 0 10px rgba(34,240,255,.9)}
+.au-manager-lead .au-manager-icon{background:#173b44}
+.au-leadbadge{position:absolute;top:5px;right:5px;z-index:2;background:#22f0ff;color:#04121A;font-size:.55rem;font-weight:900;letter-spacing:.12em;padding:2px 6px;border-radius:4px;box-shadow:0 0 10px #22f0ff}
+.au-manager-out{opacity:.4;filter:grayscale(.7)}
+.au-tbl tr.lead td{background:rgba(34,240,255,.16)}.au-tbl tr.lead td:first-child{box-shadow:inset 3px 0 0 #22f0ff}
+.au-hero .au-lead{color:#7ff6ff;text-shadow:0 0 12px rgba(34,240,255,.8)}
+@keyframes neonpulse{from{box-shadow:0 0 4px #22f0ff,0 0 14px rgba(34,240,255,.55),0 0 28px rgba(139,92,246,.4),inset 0 0 10px rgba(34,240,255,.18)}to{box-shadow:0 0 8px #22f0ff,0 0 26px rgba(34,240,255,.9),0 0 56px rgba(139,92,246,.75),inset 0 0 20px rgba(34,240,255,.32)}}
 </style>"""
 
 
@@ -1276,8 +1398,12 @@ def topbar(s: dict, sn: Snap, right: str = "") -> None:
     cfg = s["settings"]
     pill = ('<span class="au-pill au-paused">PAUSED</span>' if s["paused"] else
             '<span class="au-pill au-live">LIVE</span>' if s["current"] else '<span class="au-pill au-idle">STANDBY</span>')
-    html_block(banner_html(sn) + f'<div class="au"><div class="au-top"><div><div class="au-brand">{e(cfg["title"])}</div>'
-               f'<div class="au-sub">{e(cfg["subtitle"])}</div></div><div>{right}{conn_html(sn)}{pill}</div></div></div>')
+    logo = static_img("", "logo")
+    logo_html = f'<img class="au-logo" src="{e(logo)}" alt="Sports committee logo">' if logo else ""
+    ev = current_event()
+    ev_pill = f'<span class="au-pill au-idle">{e(event_labels().get(ev, ev).upper())}</span>' if ev else ""
+    html_block(banner_html(sn) + f'<div class="au"><div class="au-top"><div class="au-brandrow">{logo_html}<div><div class="au-brand">{e(cfg["title"])}</div>'
+               f'<div class="au-sub">{e(cfg["subtitle"])}</div></div></div><div>{right}{ev_pill}{conn_html(sn)}{pill}</div></div></div>')
 
 
 def unavailable(sn: Snap) -> None:
@@ -1299,8 +1425,10 @@ def hero_html(s: dict, compact: bool = False) -> str:
     call = {1: "GOING ONCE", 2: "GOING TWICE"}.get(cur["call"], "")
     origin = f'<div class="au-meta">From {e(p["origin"])}</div>' if p["origin"] else ""
     tag = f'<div class="au-tag">{e(p["role"])}</div>' if p["role"] else ""
-    return (f'<div class="au au-card au-hero{" au-compact" if compact else ""}"><div class="au-kicker">Now on the block · '
-            f'Lot {lot} of {len(s["players"])}</div>{tag}<div class="au-pname">{e(p["name"])}</div>{origin}'
+    photo = static_img("players", p["name"])
+    ph = f'<img class="au-photo" src="{e(photo)}" alt="">' if photo else ""
+    return (f'<div class="au au-card au-hero{" au-compact" if compact else ""}"><div class="au-herorow">{ph}<div><div class="au-kicker">Now on the block · '
+            f'Lot {lot} of {len(s["players"])}</div>{tag}<div class="au-pname">{e(p["name"])}</div>{origin}</div></div>'
             f'<div class="au-grid"><div><div class="au-lbl">Base price</div><div class="au-val">{money(p["base"])}</div></div>'
             f'<div><div class="au-lbl">Current bid</div>{bid}</div><div><div class="au-lbl">Leading</div>{lead}</div></div>'
             + (f'<div class="au-call">{call}</div>' if call else "") + "</div>")
@@ -1319,7 +1447,9 @@ def history_html(s: dict, n: int = 6) -> str:
 def idle_html(s: dict) -> str:
     lr = s["last_result"]
     if lr and lr["kind"] == "sold":
-        body = (f'<div class="au au-card au-sold"><div class="au-stamp">SOLD</div><div class="au-big">{e(lr["player"])}</div>'
+        sp = static_img("players", lr["player"])
+        sph = f'<img class="au-photo" style="margin:0 auto 12px" src="{e(sp)}" alt="">' if sp else ""
+        body = (f'<div class="au au-card au-sold">{sph}<div class="au-stamp">SOLD</div><div class="au-big">{e(lr["player"])}</div>'
                 f'<div class="au-meta">{e(lr["role"])}{" · " if lr["role"] and lr["origin"] else ""}{e(lr["origin"])}</div>'
                 f'<div class="au-price">{money(lr["price"])}</div>'
                 f'<div class="au-lead" style="margin-top:12px">{e(lr["team"])}</div><div class="au-small">{e(lr["manager"])}</div></div>')
@@ -1388,8 +1518,16 @@ def screen_managers_html(s: dict) -> str:
     """Compact manager cards for the projector. Only public team/manager names are shown."""
     icons = ["👨🏻‍💼", "👩🏻‍💼", "🧑🏻‍💼", "👨🏽‍💻", "👩🏽‍💼", "🧑🏾‍💼", "👨🏻‍💻", "👩🏻‍💻"]
     cards = ""
+    cur = s.get("current")
+    leader = cur["leader"] if cur else None
+    outs = set(cur["out"]) if cur else set()
     for i, m in enumerate(s["managers"].values()):
-        cards += (f'<div class="au-manager"><div class="au-manager-icon">{icons[i % len(icons)]}</div>'
+        logo = static_img("teams", m["team"])
+        icon = f'<img class="au-timg" src="{e(logo)}" alt="">' if logo else icons[i % len(icons)]
+        is_lead = leader is not None and m["id"] == leader
+        cls = "au-manager" + (" au-manager-lead" if is_lead else " au-manager-out" if m["id"] in outs else "")
+        badge = '<div class="au-leadbadge">LEADING</div>' if is_lead else ""
+        cards += (f'<div class="{cls}">{badge}<div class="au-manager-icon">{icon}</div>'
                   f'<div class="au-manager-team">{e(m["team"])}</div>'
                   f'<div class="au-manager-name">{e(m["name"])}</div></div>')
     return (f'<div class="au au-card"><div class="au-sec">Auction managers</div>'
@@ -1428,15 +1566,31 @@ def screen_current_bid_html(s: dict) -> str:
     return html
 
 
+CRICKET_CATS = [
+    ("Batsmen", ("bat", "batter", "batsman")),
+    ("Keepers", ("keeper", "wicketkeeper", "wicket-keeper")),
+    ("All-rounders", ("allrounder", "all-rounder", "all rounder")),
+    ("Fast bowlers", ("fast bowler", "pace bowler", "bowler")),
+    ("Spinners", ("spinner", "spin bowler")),
+]
+
+
 def screen_team_stats_html(s: dict) -> str:
     """Public squad-category counts derived from the actual sale/player records."""
-    categories = [
-        ("Batsmen", ("bat", "batter", "batsman")),
-        ("Keepers", ("keeper", "wicketkeeper", "wicket-keeper")),
-        ("All-rounders", ("allrounder", "all-rounder", "all rounder")),
-        ("Fast bowlers", ("fast bowler", "pace bowler", "bowler")),
-        ("Spinners", ("spinner", "spin bowler")),
-    ]
+    categories = CRICKET_CATS
+    roles = [str(p.get("role", "")).strip() for p in s["players"] if str(p.get("role", "")).strip()]
+    exact = False
+    if roles:
+        low = [r.lower().replace("_", " ") for r in roles]
+        hits = sum(any(t in r for _, terms in CRICKET_CATS for t in terms) for r in low)
+        if hits * 2 < len(roles):                    # not a cricket roster: one row per distinct role (football, etc.)
+            first, counts = {}, {}
+            for r in roles:
+                k = r.lower().replace("_", " ")
+                first.setdefault(k, r)
+                counts[k] = counts.get(k, 0) + 1
+            top = sorted(counts, key=lambda k: (-counts[k], k))[:6]
+            categories, exact = [(first[k], (k,)) for k in top], True
     team_cards = ""
     sales_by_manager = {mid: [] for mid in s["managers"]}
     for sale in s["sales"]:
@@ -1451,7 +1605,7 @@ def screen_team_stats_html(s: dict) -> str:
             count = 0
             for player in roster:
                 role = str(player.get("role", "")).lower().replace("_", " ")
-                if any(term in role for term in terms):
+                if any((term == role) if exact else (term in role) for term in terms):
                     count += 1
             rows += f'<div class="au-teamstat-row"><span>{e(label)}</span><b>{count}</b><span>/ {len(roster)}</span></div>'
         team_cards += (f'<div class="au-teamstat"><div class="au-teamstat-title"><b>{e(m["team"])}</b>'
@@ -1468,7 +1622,7 @@ def flash_show() -> None:
 # --------------------------------------------------------------------------- views
 def view_home() -> None:
     """Neutral landing page: deliberately shows no links to the other views."""
-    sn = get_store().read()
+    sn = get_store(current_event()).read()
     title = sn.view["settings"]["title"] if sn.view else "Intellics Auction Room"
     html_block(f'<div class="au"><div class="au-card" style="text-align:center;padding:64px 24px;margin-top:12vh">'
                f'<div class="au-brand" style="font-size:clamp(1.6rem,3vw,3rem)">{e(title)}</div>'
@@ -1482,6 +1636,7 @@ def screen_live(S: Store) -> None:
     Bidding controls deliberately remain in the authenticated manager view (?view=bid).
     The projector must never be able to mutate auction state.
     """
+    S = get_store(current_event())                    # follow the organiser's event choice on every refresh
     sn = S.read()
     if sn.view is None:
         html_block(banner_html(sn))
@@ -1500,12 +1655,13 @@ def screen_live(S: Store) -> None:
 
 
 def view_screen() -> None:
-    screen_live(get_store())
+    screen_live(get_store(current_event()))
 
 
 @st.fragment(run_every=POLL_BID)
 def bid_console(S: Store) -> None:
     ss = st.session_state
+    S = get_store(current_event())
     sn = S.read()
     actor = manager_session(sn)
     if sn.view is None or actor is None or actor["id"] not in sn.view["managers"]:
@@ -1581,7 +1737,7 @@ def bid_console(S: Store) -> None:
 
 
 def view_bid() -> None:
-    S, ss = get_store(), st.session_state
+    S, ss = get_store(current_event()), st.session_state
     sn = S.read()
     if manager_session(sn):
         bid_console(S)
@@ -1611,9 +1767,10 @@ def view_bid() -> None:
                 box["m"] = m
                 return bool(m) and check_pin(pin.strip(), m.get("pin_hash"))
 
-            ok, err = verify_login(S.backend, f"mgr:{pick}", check, PIN_MAX_FAILS, PIN_LOCK_SECONDS) if S.backend else (False, "Not configured.")
+            ok, err = verify_login(S.backend, f"mgr:{current_event()}:{pick}", check, PIN_MAX_FAILS, PIN_LOCK_SECONDS) if S.backend else (False, "Not configured.")
             if ok:
-                ss["au_mgr"] = {"id": pick, "ver": box["m"]["session_ver"], "exp": time.time() + MANAGER_SESSION_SECONDS}
+                ss["au_mgr"] = {"id": pick, "ver": box["m"]["session_ver"], "exp": time.time() + MANAGER_SESSION_SECONDS,
+                                "event": current_event()}
                 st.rerun()
             st.error(err)
 
@@ -1633,6 +1790,7 @@ def admin_login(S: Store, pin: str) -> None:
 
 @st.fragment(run_every=POLL_ADMIN)
 def admin_live(S: Store) -> None:
+    S = get_store(current_event())
     sn = S.read()
     actor = admin_actor()
     if actor is None:
@@ -1730,8 +1888,22 @@ def show_new_pins() -> None:
             st.rerun()
 
 
+def event_switcher(S: Store, sn: Snap) -> None:
+    labels, cur_ev = event_labels(), current_event()
+    ids = list(labels)
+    busy = bool(sn.view and sn.view["current"])
+    c = st.columns([2, 1, 2], vertical_alignment="bottom")
+    pick = c[0].selectbox("Active event (projector and manager screens follow this)", ids,
+                          index=ids.index(cur_ev) if cur_ev in ids else 0, format_func=lambda k: labels[k], key="adm_event_pick")
+    if c[1].button("Switch event", use_container_width=True, disabled=busy or pick == cur_ev, key="adm_event_go"):
+        ok, msg = switch_event(pick, S.backend)
+        st.session_state["au_flash"] = (ok, msg, time.time())
+        st.rerun()
+    c[2].caption(f"Now running: **{labels.get(cur_ev, cur_ev)}**." + (" Finish the current lot to switch." if busy else ""))
+
+
 def view_admin() -> None:
-    S, ss = get_store(), st.session_state
+    S, ss = get_store(current_event()), st.session_state
     pin = secret("ADMIN_PIN")
     sn = S.read()
     problem = admin_password_problem(pin)
@@ -1748,6 +1920,7 @@ def view_admin() -> None:
             html_block(banner_html(sn))
         admin_login(S, pin)
         return
+    event_switcher(S, sn)
     live_tab, setup_tab, result_tab = st.tabs(["Live control", "Setup", "Results & backup"])
     with live_tab:
         admin_live(S)
