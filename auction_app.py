@@ -24,6 +24,7 @@ ARCHITECTURE (read this once)
 """
 from __future__ import annotations
 
+import base64
 import copy
 import csv
 import hashlib
@@ -203,12 +204,33 @@ def slug(x) -> str:
 
 @lru_cache(maxsize=4096)
 def static_img(kind: str, name: str) -> str:
-    """URL of static/<kind>/<slug(name)>.png|jpg|jpeg|webp if that file exists, else ''. kind '' = static/ itself."""
+    """Image for static/<kind>/<slug(name)>.png|jpg|jpeg|webp if that file exists, else ''. kind '' = static/ itself.
+
+    The picture is shrunk and embedded in the page as a data: URI, so it shows even when the host does not
+    serve /app/static (no extra server setting needed)."""
     sl = slug(name)
-    if sl:
-        for ext in IMG_EXTS:
-            if ((STATIC_DIR / kind) if kind else STATIC_DIR).joinpath(sl + ext).is_file():
-                return f"/app/static/{kind + '/' if kind else ''}{sl}{ext}"
+    if not sl:
+        return ""
+    base = (STATIC_DIR / kind) if kind else STATIC_DIR
+    for ext in IMG_EXTS:
+        f = base / (sl + ext)
+        if not f.is_file():
+            continue
+        try:
+            from PIL import Image
+
+            im = Image.open(f)
+            im.thumbnail((200, 200) if not kind else (256, 256))
+            buf = io.BytesIO()
+            if im.mode in ("RGBA", "LA", "P"):
+                im.convert("RGBA").save(buf, "PNG", optimize=True)
+                mime = "image/png"
+            else:
+                im.convert("RGB").save(buf, "JPEG", quality=85, optimize=True)
+                mime = "image/jpeg"
+            return f"data:{mime};base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+        except Exception:  # pragma: no cover - fall back to the served file
+            return f"/app/static/{kind + '/' if kind else ''}{sl}{ext}"
     return ""
 
 
