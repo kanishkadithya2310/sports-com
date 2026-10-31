@@ -1,4 +1,4 @@
-"""Intellics Auction Room v2: a live, play-money player auction (5-10 managers + projector).
+"""ICL Auction Room v2: a live, play-money player auction (5-10 managers + projector).
 
 Run:  streamlit run auction_app.py
 
